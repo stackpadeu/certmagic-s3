@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -168,6 +169,73 @@ func TestIfNotExistsSendsWildcard(t *testing.T) {
 	}
 	if input.IfMatch != nil {
 		t.Errorf("IfMatch = %q, want it unset", aws.ToString(input.IfMatch))
+	}
+}
+
+// TestLockExpired pins staleness to LockExpiration. It used to be measured
+// against LockTimeout, which declared a healthy holder dead a few seconds into
+// a certificate order that takes about a minute.
+func TestLockExpired(t *testing.T) {
+	tests := []struct {
+		name     string
+		age      time.Duration
+		expected bool
+	}{
+		{
+			name:     "just taken",
+			age:      0,
+			expected: false,
+		},
+		{
+			name:     "past the wait budget but still working",
+			age:      LockTimeout + time.Second,
+			expected: false,
+		},
+		{
+			name:     "a certificate order in, still working",
+			age:      time.Minute,
+			expected: false,
+		},
+		{
+			name:     "just short of expiry",
+			age:      LockExpiration - time.Second,
+			expected: false,
+		},
+		{
+			name:     "expired, holder presumed gone",
+			age:      LockExpiration + time.Second,
+			expected: true,
+		},
+		{
+			name:     "abandoned long ago",
+			age:      24 * time.Hour,
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := lockExpired(time.Now().Add(-tt.age))
+			if result != tt.expected {
+				t.Errorf("lockExpired(%s old) = %v, want %v", tt.age, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestLockExpirationCoversACertificateOrder is a guard on the constants
+// themselves: a DNS-01 order was measured at about 50 seconds, so an expiry
+// anywhere near that would hand the lock to a second instance mid-order.
+func TestLockExpirationCoversACertificateOrder(t *testing.T) {
+	const measuredOrderDuration = 50 * time.Second
+
+	if LockExpiration < 2*measuredOrderDuration {
+		t.Errorf("LockExpiration = %s, want at least twice a measured %s order",
+			LockExpiration, measuredOrderDuration)
+	}
+	if LockTimeout >= LockExpiration {
+		t.Errorf("LockTimeout = %s must stay below LockExpiration = %s; it is the wait budget, not the expiry",
+			LockTimeout, LockExpiration)
 	}
 }
 

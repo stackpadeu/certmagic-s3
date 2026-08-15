@@ -160,9 +160,17 @@ func (s3 *S3) CaddyModule() caddy.ModuleInfo {
 }
 
 var (
-	LockExpiration   = 2 * time.Minute
+	// LockExpiration is how long a lock file stays valid. Its timestamp is
+	// written once when the lock is taken and never refreshed, so this has to
+	// cover a whole certificate order, not just one step of it.
+	LockExpiration = 2 * time.Minute
+	// LockPollInterval is how long to wait between attempts at taking a lock
+	// somebody else holds.
 	LockPollInterval = 1 * time.Second
-	LockTimeout      = 15 * time.Second
+	// LockTimeout is how long Lock waits for a lock somebody else holds before
+	// it gives up. It says nothing about when a lock file goes stale; that is
+	// LockExpiration.
+	LockTimeout = 15 * time.Second
 )
 
 func (s3 *S3) Lock(ctx context.Context, key string) error {
@@ -215,12 +223,31 @@ func (s3 *S3) tryLock(ctx context.Context, key string) (bool, error) {
 		// Lock file does not make sense, overwrite.
 		return s3.putLockFile(ctx, key, ifUnchanged(result.ETag))
 	}
-	if lt.Add(LockTimeout).Before(time.Now()) {
+	if lockExpired(lt) {
 		// Existing lock file expired, overwrite.
 		return s3.putLockFile(ctx, key, ifUnchanged(result.ETag))
 	}
 
 	return false, nil
+}
+
+// lockExpired reports whether a lock file written at lt is old enough that the
+// instance that wrote it is presumed gone and the lock may be taken over.
+//
+// This has to be measured against LockExpiration. Measuring it against
+// LockTimeout, the budget for how long Lock waits, declares a holder dead after
+// 15 seconds, which is a third of the way into a DNS-01 order on a typical
+// account, so every other instance would take the lock away from a holder that
+// is doing exactly what it should.
+//
+// Note that the timestamp is written once and never refreshed. A holder that
+// keeps the lock across CertMagic's retry backoff holds it for much longer than
+// LockExpiration and can be taken over while it is still working. Renewing the
+// lease while the work is in progress is what CertMagic's optional
+// LockLeaseRenewer interface is for; this module cannot implement it while it
+// builds against a CertMagic release that predates it.
+func lockExpired(lt time.Time) bool {
+	return lt.Add(LockExpiration).Before(time.Now())
 }
 
 // ifNotExists only writes the lock file when there is no lock file yet, so
