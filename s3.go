@@ -20,6 +20,7 @@ import (
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
@@ -169,34 +170,12 @@ func (s3 *S3) Lock(ctx context.Context, key string) error {
 	startedAt := time.Now()
 
 	for {
-		input := &s3sdk.GetObjectInput{
-			Bucket: aws.String(s3.Bucket),
-			Key:    aws.String(s3.objLockName(key)),
-		}
-
-		result, err := s3.Client.GetObject(ctx, input)
+		acquired, err := s3.tryLock(ctx, key)
 		if err != nil {
-			var nsk *types.NoSuchKey
-			if errors.As(err, &nsk) {
-				return s3.putLockFile(ctx, key)
-			}
-			continue
+			return err
 		}
-
-		buf, err := io.ReadAll(result.Body)
-		_ = result.Body.Close()
-		if err != nil {
-			continue
-		}
-
-		lt, err := time.Parse(time.RFC3339, string(buf))
-		if err != nil {
-			// Lock file does not make sense, overwrite.
-			return s3.putLockFile(ctx, key)
-		}
-		if lt.Add(LockTimeout).Before(time.Now()) {
-			// Existing lock file expired, overwrite.
-			return s3.putLockFile(ctx, key)
+		if acquired {
+			return nil
 		}
 
 		if startedAt.Add(LockTimeout).Before(time.Now()) {
@@ -206,8 +185,62 @@ func (s3 *S3) Lock(ctx context.Context, key string) error {
 	}
 }
 
-func (s3 *S3) putLockFile(ctx context.Context, key string) error {
-	// Object does not exist, we're creating a lock file.
+// tryLock makes a single attempt at taking the lock and reports whether it
+// succeeded. Not getting the lock is not an error: another instance holds it
+// and the caller keeps waiting.
+func (s3 *S3) tryLock(ctx context.Context, key string) (bool, error) {
+	input := &s3sdk.GetObjectInput{
+		Bucket: aws.String(s3.Bucket),
+		Key:    aws.String(s3.objLockName(key)),
+	}
+
+	result, err := s3.Client.GetObject(ctx, input)
+	if err != nil {
+		var nsk *types.NoSuchKey
+		if !errors.As(err, &nsk) {
+			return false, nil
+		}
+		// There is no lock file, we're creating one.
+		return s3.putLockFile(ctx, key, ifNotExists)
+	}
+
+	buf, err := io.ReadAll(result.Body)
+	_ = result.Body.Close()
+	if err != nil {
+		return false, nil
+	}
+
+	lt, err := time.Parse(time.RFC3339, string(buf))
+	if err != nil {
+		// Lock file does not make sense, overwrite.
+		return s3.putLockFile(ctx, key, ifUnchanged(result.ETag))
+	}
+	if lt.Add(LockTimeout).Before(time.Now()) {
+		// Existing lock file expired, overwrite.
+		return s3.putLockFile(ctx, key, ifUnchanged(result.ETag))
+	}
+
+	return false, nil
+}
+
+// ifNotExists only writes the lock file when there is no lock file yet, so
+// that exactly one of several instances asking at the same time gets the lock.
+func ifNotExists(input *s3sdk.PutObjectInput) {
+	input.IfNoneMatch = aws.String("*")
+}
+
+// ifUnchanged only writes the lock file when it is still the one we read, so
+// that a lock another instance took or refreshed in the meantime is left alone.
+func ifUnchanged(etag *string) func(*s3sdk.PutObjectInput) {
+	return func(input *s3sdk.PutObjectInput) {
+		input.IfMatch = etag
+	}
+}
+
+// putLockFile writes the lock file under the given condition and reports
+// whether the write went through. Failing the condition means another instance
+// got there first, which is not an error.
+func (s3 *S3) putLockFile(ctx context.Context, key string, condition func(*s3sdk.PutObjectInput)) (bool, error) {
 	lockData := []byte(time.Now().Format(time.RFC3339))
 	r := bytes.NewReader(lockData)
 
@@ -217,9 +250,33 @@ func (s3 *S3) putLockFile(ctx context.Context, key string) error {
 		Body:          r,
 		ContentLength: aws.Int64(int64(len(lockData))),
 	}
+	condition(input)
 
-	_, err := s3.Client.PutObject(ctx, input)
-	return err
+	if _, err := s3.Client.PutObject(ctx, input); err != nil {
+		if conditionFailed(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// conditionFailed reports whether a conditional write did not happen because
+// the lock file changed while we were looking at it: another instance took it
+// (PreconditionFailed), wrote it at the same moment (ConditionalRequestConflict)
+// or released it (NoSuchKey, for a write conditional on an ETag).
+func conditionFailed(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+
+	switch apiErr.ErrorCode() {
+	case "PreconditionFailed", "ConditionalRequestConflict", "NoSuchKey":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s3 *S3) Unlock(ctx context.Context, key string) error {

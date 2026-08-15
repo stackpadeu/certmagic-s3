@@ -1,7 +1,12 @@
 package s3
 
 import (
+	"errors"
+	"fmt"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
 func TestS3_objName(t *testing.T) {
@@ -50,6 +55,54 @@ func TestS3_objLockName(t *testing.T) {
 	result := s3.objLockName(key)
 	if result != expected {
 		t.Errorf("objLockName() = %v, want %v", result, expected)
+	}
+}
+
+func TestConditionFailed(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "another instance holds the lock",
+			err:      &smithy.GenericAPIError{Code: "PreconditionFailed"},
+			expected: true,
+		},
+		{
+			name:     "raced another conditional write",
+			err:      &smithy.GenericAPIError{Code: "ConditionalRequestConflict"},
+			expected: true,
+		},
+		{
+			name:     "lock released before we could take it over",
+			err:      &types.NoSuchKey{},
+			expected: true,
+		},
+		{
+			name:     "wrapped api error",
+			err:      fmt.Errorf("put lock file: %w", &smithy.GenericAPIError{Code: "PreconditionFailed"}),
+			expected: true,
+		},
+		{
+			name:     "unrelated api error",
+			err:      &types.NoSuchBucket{},
+			expected: false,
+		},
+		{
+			name:     "plain error",
+			err:      errors.New("connection reset"),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := conditionFailed(tt.err)
+			if result != tt.expected {
+				t.Errorf("conditionFailed() = %v, want %v", result, tt.expected)
+			}
+		})
 	}
 }
 
