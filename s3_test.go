@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 )
@@ -103,6 +105,69 @@ func TestConditionFailed(t *testing.T) {
 				t.Errorf("conditionFailed() = %v, want %v", result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestEntityTag(t *testing.T) {
+	tests := []struct {
+		name     string
+		etag     *string
+		expected string
+	}{
+		{
+			name:     "quoted, as GetObject returns it",
+			etag:     aws.String(`"6654c734ccab8f440ff0825eb443dc7f"`),
+			expected: "6654c734ccab8f440ff0825eb443dc7f",
+		},
+		{
+			name:     "multipart etag keeps its part count",
+			etag:     aws.String(`"6654c734ccab8f440ff0825eb443dc7f-3"`),
+			expected: "6654c734ccab8f440ff0825eb443dc7f-3",
+		},
+		{
+			name:     "already unquoted",
+			etag:     aws.String("6654c734ccab8f440ff0825eb443dc7f"),
+			expected: "6654c734ccab8f440ff0825eb443dc7f",
+		},
+		{
+			name:     "absent",
+			etag:     nil,
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := entityTag(tt.etag)
+			if result != tt.expected {
+				t.Errorf("entityTag() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestIfUnchangedSendsUnquotedETag guards the header form directly: Ceph
+// answers 412 to a quoted If-Match, which leaves an abandoned lock impossible
+// to take over.
+func TestIfUnchangedSendsUnquotedETag(t *testing.T) {
+	input := &s3sdk.PutObjectInput{}
+	ifUnchanged(aws.String(`"6654c734ccab8f440ff0825eb443dc7f"`))(input)
+
+	expected := "6654c734ccab8f440ff0825eb443dc7f"
+	if aws.ToString(input.IfMatch) != expected {
+		t.Errorf("IfMatch = %q, want %q", aws.ToString(input.IfMatch), expected)
+	}
+}
+
+func TestIfNotExistsSendsWildcard(t *testing.T) {
+	input := &s3sdk.PutObjectInput{}
+	ifNotExists(input)
+
+	if aws.ToString(input.IfNoneMatch) != "*" {
+		t.Errorf("IfNoneMatch = %q, want %q", aws.ToString(input.IfNoneMatch), "*")
+	}
+	if input.IfMatch != nil {
+		t.Errorf("IfMatch = %q, want it unset", aws.ToString(input.IfMatch))
 	}
 }
 
