@@ -265,18 +265,16 @@ func ifUnchanged(etag *string) func(*s3sdk.PutObjectInput) {
 }
 
 // entityTag strips the double quotes an ETag comes back in, because Ceph RADOS
-// Gateway refuses a quoted If-Match on PutObject.
+// Gateway refuses a quoted If-Match on a conditional PutObject.
 //
 // Passing the ETag through untouched looks right: RFC 9110 puts the quotes
-// inside the entity-tag itself, GetObject hands it back that way, and Amazon's
-// own SDK examples feed it straight to If-Match. But Ceph's PutObject path
-// compares the raw header against the stored tag without unquoting it first
-// (https://tracker.ceph.com/issues/64439, still open, still unfixed in Squid
-// v19 and in Tentacle up to v20.2.0), so a quoted If-Match matches nothing and
-// every conditional write is answered with 412. A lock left behind by an
-// instance that died then cannot be taken over by anybody: the takeover write
-// is refused forever and the object has to be deleted by hand before
-// certificates can be issued again.
+// inside the entity-tag itself, and GetObject hands it back that way. But
+// Ceph's conditional write path compared the raw header against the stored tag
+// without unquoting it first, so a quoted If-Match matched nothing and every
+// takeover write came back 412. Fixed in ceph/ceph#63348, merged to main on
+// 2025-07-28; the tentacle backport ceph/ceph#65949 merged on 2026-02-19, after
+// v20.2.0 was cut, and the squid backport ceph/ceph#65932 is still open, so
+// v19.x and v20.2.0 are affected.
 //
 // Measured against Hetzner Object Storage (Ceph), for an object whose ETag is
 // "fe4c0f30aa359c41d9f9a5f69c8c4192":
@@ -289,17 +287,14 @@ func ifUnchanged(etag *string) func(*s3sdk.PutObjectInput) {
 // accepted: a tag that does not match is still refused, so the condition really
 // is being evaluated and two instances still cannot both take a lock over.
 //
-// No single spelling is proven correct everywhere. The quoted form is the one
-// RFC 9110 defines and the only one proven against Amazon S3; the unquoted form
-// is the only one that works on Ceph. This sends the unquoted form because it
-// is the only candidate that can satisfy both: it is what Ceph's own s3-tests
-// send for this operation, MinIO, SeaweedFS and versitygw strip the quotes from
-// both sides before comparing, and terraform-provider-aws sends bare tags to
-// Amazon S3. Only the Ceph half of that has been measured here, so if you run
-// this against Amazon and takeovers stop working, this is the first place to
-// look. Trying one form and falling back to the other on 412 is not an option:
-// 412 is also how a genuinely lost race reports itself, and retrying past it
-// would break the mutual exclusion this condition exists to provide.
+// Stripping is the portable spelling, not a workaround for one server. Ceph's
+// own compliance suite strips the quotes before setting If-Match on PutObject
+// (ceph/s3-tests, test_put_object_ifmatch_good), MinIO, SeaweedFS and versitygw
+// compare with the quotes off on both sides, and stripping stays correct once
+// the Ceph fix has reached every release, because taking quotes off a bare tag
+// does nothing. Trying the quoted form first and falling back on 412 is not an
+// option: 412 is also how a genuinely lost race reports itself, so retrying
+// past it would break the mutual exclusion this condition exists to provide.
 func entityTag(etag *string) string {
 	return strings.Trim(aws.ToString(etag), `"`)
 }
