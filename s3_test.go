@@ -109,6 +109,72 @@ func TestConditionFailed(t *testing.T) {
 	}
 }
 
+// TestIsNotExist covers both shapes a missing object arrives in. HeadObject
+// has no error body to carry a code, so a missing key reaches Stat as
+// *types.NotFound and never as *types.NoSuchKey.
+func TestIsNotExist(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "HeadObject on a missing key",
+			err:      &types.NotFound{},
+			expected: true,
+		},
+		{
+			name:     "GetObject on a missing key",
+			err:      &types.NoSuchKey{},
+			expected: true,
+		},
+		{
+			name:     "wrapped, as the SDK hands it up through its middleware",
+			err:      fmt.Errorf("operation error S3: HeadObject: %w", &types.NotFound{}),
+			expected: true,
+		},
+		{
+			name:     "wrapped NoSuchKey",
+			err:      fmt.Errorf("operation error S3: GetObject: %w", &types.NoSuchKey{}),
+			expected: true,
+		},
+		{
+			name:     "the bucket is gone, which is not the same as the key being absent",
+			err:      &types.NoSuchBucket{},
+			expected: false,
+		},
+		{
+			name:     "denied, which must not be reported as absent",
+			err:      &smithy.GenericAPIError{Code: "AccessDenied"},
+			expected: false,
+		},
+		{
+			name:     "transport failure",
+			err:      errors.New("connection reset"),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isNotExist(tt.err)
+			if result != tt.expected {
+				t.Errorf("isNotExist() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestHeadObject404IsNotNoSuchKey records the reason the check had to change.
+// Stat looked only for *types.NoSuchKey, which the error from a HeadObject 404
+// can never satisfy, so a missing key was reported as a transport error.
+func TestHeadObject404IsNotNoSuchKey(t *testing.T) {
+	var noSuchKey *types.NoSuchKey
+	if errors.As(&types.NotFound{}, &noSuchKey) {
+		t.Fatal("*types.NotFound must not satisfy errors.As for *types.NoSuchKey")
+	}
+}
+
 func TestEntityTag(t *testing.T) {
 	tests := []struct {
 		name     string

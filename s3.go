@@ -353,6 +353,27 @@ func (s3 *S3) Unlock(ctx context.Context, key string) error {
 	return err
 }
 
+// isNotExist reports whether err means the object simply is not there, as
+// opposed to something having gone wrong on the way to finding out.
+//
+// The two ways of reading an object report a missing one differently, and only
+// one of them is obvious. GetObject answers with an error body carrying the
+// NoSuchKey code, which the SDK turns into *types.NoSuchKey. HeadObject has no
+// body to carry a code, so the SDK maps the bare 404 onto *types.NotFound.
+// Checking only for NoSuchKey therefore never recognises a missing object on
+// the HeadObject path, and callers get a transport-shaped error instead of a
+// plain "not found".
+//
+// Getting this wrong matters most on an empty store. A node that starts up
+// before any certificate has been written asks for keys that are legitimately
+// absent, and it has to be able to tell that from a storage failure to carry on
+// calmly until the issuer has written them.
+func isNotExist(err error) bool {
+	var noSuchKey *types.NoSuchKey
+	var notFound *types.NotFound
+	return errors.As(err, &noSuchKey) || errors.As(err, &notFound)
+}
+
 func (s3 *S3) Store(ctx context.Context, key string, value []byte) error {
 	start := time.Now()
 	objName := s3.objName(key)
@@ -413,8 +434,7 @@ func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
 
 	result, err := s3.Client.GetObject(ctx, input)
 	if err != nil {
-		var nsk *types.NoSuchKey
-		if errors.As(err, &nsk) {
+		if isNotExist(err) {
 			return nil, fs.ErrNotExist
 		}
 		return nil, fmt.Errorf("failed to load key %s: %w", key, err)
@@ -514,8 +534,7 @@ func (s3 *S3) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
 
 	result, err := s3.Client.HeadObject(ctx, input)
 	if err != nil {
-		var nsk *types.NoSuchKey
-		if errors.As(err, &nsk) {
+		if isNotExist(err) {
 			return ki, fs.ErrNotExist
 		}
 		return ki, err
